@@ -14,7 +14,7 @@ A two-line status bar for Claude Code showing:
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-statusline.git
+git clone https://github.com/Zaki0207/claude-statusline.git
 cd claude-statusline
 bash install.sh
 ```
