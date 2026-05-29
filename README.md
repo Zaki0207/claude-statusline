@@ -1,26 +1,24 @@
-# Claude Code Status Line
+# ai-cli-kit
 
-A two-line status bar for Claude Code showing:
+A collection of tools, configs, and tips for AI coding CLI assistants.
 
-- **Line 1:** Model | Context window usage | Token counts (↑input ↓output) | Cache hit rate | Estimated cost
-- **Line 2:** Working directory | Git branch | 5-hour rate limit | 7-day rate limit
+## Contents
 
-## Requirements
+### Claude Code
 
-- `jq`
-- `bc`
-- `git`
+| Directory | Description |
+|-----------|-------------|
+| [claude-code/statusline](claude-code/statusline/) | Two-line status bar showing model, tokens, cost, and rate limits |
+| [claude-code/hooks](claude-code/hooks/) | Hook scripts for automating tasks around Claude Code |
+| [claude-code/settings](claude-code/settings/) | Settings templates and best practices |
+| [claude-code/mcp](claude-code/mcp/) | Recommended MCP servers and configuration |
 
-## Install
+### Codex
 
-```bash
-git clone https://github.com/Zaki0207/claude-statusline.git
-cd claude-statusline
-bash install.sh
-```
+| Directory | Description |
+|-----------|-------------|
+| [codex](codex/) | Tips and notes for OpenAI Codex CLI |
 
-Then restart Claude Code.
+## Contributing
 
-## Uninstall
-
-Remove the `statusLine` key from `~/.claude/settings.json` and delete `~/.claude/statusline-command.sh`.
+PRs welcome. Each tool/tip should live in its own subdirectory with a README.
