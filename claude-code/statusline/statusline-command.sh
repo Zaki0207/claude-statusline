@@ -91,48 +91,19 @@ used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 ctx_total=$(echo "$input" | jq -r '.context_window.context_window_size // empty')
 ctx_used=$(echo "$input"  | jq -r '.context_window.total_input_tokens // empty')
 
-# ── 5. Token statistics ───────────────────────────────────────────────────
-# Fields used:
-#   total_input_tokens          = cumulative input tokens for the session (grows each turn)
-#   current_usage.output_tokens = output tokens from the most recent API response (not cumulative)
-#   current_usage.cache_read_input_tokens    = cache tokens read this turn
-#   current_usage.cache_creation_input_tokens = cache tokens written this turn
-sess_in=$(echo "$input"   | jq -r '.context_window.total_input_tokens // empty')
-cur_out=$(echo "$input"   | jq -r '.context_window.current_usage.output_tokens // empty')
+# ── 5. Token statistics (current turn, from the most recent API response) ──
+# Every value reflects the latest turn only. Claude Code no longer exposes
+# session-cumulative totals (total_input_tokens became current-context as of
+# v2.1.132), so we display the per-turn figures it provides directly and never
+# accumulate locally.
+#   total_input_tokens  = total input this turn (input + cache_creation + cache_read)  → ↑
+#   total_output_tokens = output tokens from the most recent response                  → ↓
+#   current_usage.*     = per-component breakdown of the same turn (used for cache %)
+turn_in=$(echo "$input"  | jq -r '.context_window.total_input_tokens // empty')
+turn_out=$(echo "$input" | jq -r '.context_window.total_output_tokens // .context_window.current_usage.output_tokens // empty')
+cur_in=$(echo "$input"   | jq -r '.context_window.current_usage.input_tokens // empty')
 cache_read=$(echo "$input"  | jq -r '.context_window.current_usage.cache_read_input_tokens // empty')
 cache_write=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // empty')
-
-# ── 5a. Accumulate output tokens locally per session ─────────────────────
-# Uses /tmp/claude_statusline_output_<session_id>.txt to persist across refreshes.
-# File format: "<last_cur_out>:<accumulated_total>"
-# If cur_out differs from last recorded value → new response → add to total.
-session_id=$(echo "$input" | jq -r '.session_id // empty')
-if [ -n "$session_id" ]; then
-  acc_file="/tmp/claude_statusline_output_${session_id}.txt"
-else
-  acc_file="/tmp/claude_statusline_output.txt"
-fi
-
-sess_out=0
-if [ -n "$cur_out" ] && [ "$cur_out" -gt 0 ] 2>/dev/null; then
-  if [ -f "$acc_file" ]; then
-    last_cur=$(cut -d: -f1 "$acc_file" 2>/dev/null)
-    acc_total=$(cut -d: -f2 "$acc_file" 2>/dev/null)
-    # Ensure values are numeric
-    last_cur=$(echo "$last_cur" | grep -E '^[0-9]+$' || echo 0)
-    acc_total=$(echo "$acc_total" | grep -E '^[0-9]+$' || echo 0)
-    if [ "$cur_out" != "$last_cur" ]; then
-      # New response detected — add this turn's output to the accumulator
-      acc_total=$(( acc_total + cur_out ))
-      printf '%s:%s\n' "$cur_out" "$acc_total" > "$acc_file"
-    fi
-    sess_out="$acc_total"
-  else
-    # First time seeing this session — initialize with current output
-    printf '%s:%s\n' "$cur_out" "$cur_out" > "$acc_file"
-    sess_out="$cur_out"
-  fi
-fi
 
 # ── Helper: format token count (>= 1000 → X.Xk) ──────────────────────────
 fmt_tokens() {
@@ -150,41 +121,34 @@ if [ -n "$thinking_tokens" ] && [ "$thinking_tokens" -gt 0 ] 2>/dev/null; then
   model="$model | think: $think_fmt"
 fi
 
-# ── 5c. Cache hit rate ─────────────────────────────────────────────────────
-# cache_read / total_input * 100  (integer %)
+# ── 5c. Cache read share ───────────────────────────────────────────────────
+# Share of this turn's input that came from cache reads (cheap), not a prefix
+# hit rate. Denominator is the full current-turn input, summed from the three
+# current_usage components so it stays self-consistent and avoids depending on
+# total_input_tokens (null before the first API call; historically ambiguous).
+#   cache_read / (input + cache_creation + cache_read) * 100
+# Shown whenever caching is active this turn (any reads or writes), so a cold
+# turn that only writes cache correctly reads 0% instead of vanishing.
 cache_hit_str=""
-if [ -n "$cache_read" ] && [ -n "$sess_in" ] && [ "$sess_in" -gt 0 ] 2>/dev/null && [ "$cache_read" -gt 0 ] 2>/dev/null; then
-  cache_hit_pct=$(awk "BEGIN { printf \"%.0f\", ($cache_read / $sess_in) * 100 }")
-  cache_hit_str=$(printf '%bcache:%b %s%%' "$COLOR_DARK_GRAY" "$COLOR_RESET" "$cache_hit_pct")
+_ci=${cur_in:-0}; _cw=${cache_write:-0}; _cr=${cache_read:-0}
+if { [ "$_cr" -gt 0 ] 2>/dev/null || [ "$_cw" -gt 0 ] 2>/dev/null; }; then
+  cache_total_in=$(( _ci + _cw + _cr ))
+  if [ "$cache_total_in" -gt 0 ] 2>/dev/null; then
+    cache_hit_pct=$(awk "BEGIN { printf \"%.0f\", ($_cr / $cache_total_in) * 100 }")
+    cache_hit_str=$(printf '%bcache:%b %s%%' "$COLOR_DARK_GRAY" "$COLOR_RESET" "$cache_hit_pct")
+  fi
 fi
 
-# ── 5d. Estimated cost ─────────────────────────────────────────────────────
-# Pricing per 1M tokens (input / output / cache_read / cache_write)
+# ── 5d. Session cost ───────────────────────────────────────────────────────
+# Use Claude Code's own client-side estimate (cost.total_cost_usd) rather than
+# re-deriving it from token counts. Self-derivation double-counts cache tokens
+# (total_input_tokens already includes cache_read + cache_creation) and mixes
+# per-turn context counts with the locally accumulated output total.
 cost_str=""
-raw_model_id=$(echo "$input" | jq -r '.model.id // empty')
-if [ -n "$raw_model_id" ] && [ -n "$sess_in" ]; then
-  # Determine pricing tier based on model id substring
-  cost_str=$(awk -v model="$raw_model_id" \
-                 -v t_in="${sess_in:-0}" \
-                 -v t_out="${sess_out:-0}" \
-                 -v t_cr="${cache_read:-0}" \
-                 -v t_cw="${cache_write:-0}" \
+total_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
+if [ -n "$total_cost" ]; then
+  cost_str=$(awk -v cost="$total_cost" \
     'BEGIN {
-      # Default: unknown model → zero cost, skip display
-      p_in = 0; p_out = 0; p_cr = 0; p_cw = 0; known = 0
-
-      if (model ~ /opus/) {
-        p_in = 15; p_out = 75; p_cr = 1.50; p_cw = 18.75; known = 1
-      } else if (model ~ /haiku/) {
-        p_in = 0.80; p_out = 4; p_cr = 0.08; p_cw = 1; known = 1
-      } else if (model ~ /sonnet/) {
-        p_in = 3; p_out = 15; p_cr = 0.30; p_cw = 3.75; known = 1
-      }
-
-      if (!known) { exit 0 }
-
-      cost = (t_in * p_in + t_out * p_out + t_cr * p_cr + t_cw * p_cw) / 1000000
-
       # Color thresholds
       GREEN  = "\033[32m"
       YELLOW = "\033[33m"
@@ -199,10 +163,8 @@ if [ -n "$raw_model_id" ] && [ -n "$sess_in" ]; then
         color = GREEN
       }
 
-      if (cost < 0.01) {
+      if (cost > 0 && cost < 0.01) {
         printf "%s<$0.01%s", color, RESET
-      } else if (cost < 1.0) {
-        printf "%s$%.2f%s", color, cost, RESET
       } else {
         printf "%s$%.2f%s", color, cost, RESET
       }
@@ -256,21 +218,24 @@ if [ -n "$used_pct" ]; then
   fi
 fi
 
-# Section 5: token statistics
-# Tokens: cumInput↑  cumOutput↓  cache: X%
+# Section 5: token statistics (current turn)
+# Tokens: <input>↑  <output>↓  cache: X%
+# Each arrow is this turn's figure; nothing is accumulated across turns.
 token_str=""
 
-if [ -n "$sess_in" ] || [ "$sess_out" -gt 0 ] 2>/dev/null; then
+_in_pos=0;  [ "${turn_in:-0}"  -gt 0 ] 2>/dev/null && _in_pos=1
+_out_pos=0; [ "${turn_out:-0}" -gt 0 ] 2>/dev/null && _out_pos=1
+if [ "$_in_pos" -eq 1 ] || [ "$_out_pos" -eq 1 ]; then
   token_part=$(printf '%bTokens:%b' "$COLOR_DARK_GRAY" "$COLOR_RESET")
-  if [ -n "$sess_in" ]; then
-    s_in_fmt=$(fmt_tokens "$sess_in")
+  if [ "$_in_pos" -eq 1 ]; then
+    s_in_fmt=$(fmt_tokens "$turn_in")
     token_part="${token_part} $(printf '%b%s%b↑' "$COLOR_WHITE" "$s_in_fmt" "$COLOR_RESET")"
   fi
-  if [ "$sess_out" -gt 0 ] 2>/dev/null; then
-    s_out_fmt=$(fmt_tokens "$sess_out")
+  if [ "$_out_pos" -eq 1 ]; then
+    s_out_fmt=$(fmt_tokens "$turn_out")
     token_part="${token_part} $(printf '%b%s%b↓' "$COLOR_WHITE" "$s_out_fmt" "$COLOR_RESET")"
   fi
-  # Cache hit rate only (no cr/cw raw numbers)
+  # Cache read share (no raw cr/cw numbers)
   if [ -n "$cache_hit_str" ]; then
     token_part="${token_part}  ${cache_hit_str}"
   fi
@@ -329,7 +294,11 @@ fi
 
 # Append estimated cost at the end of Line 1
 if [ -n "$cost_str" ]; then
-  line1="${line1}${SEP}${cost_str}"
+  if [ -n "$line1" ]; then
+    line1="${line1}${SEP}${cost_str}"
+  else
+    line1="$cost_str"
+  fi
 fi
 
 # ── Assemble Line 2: directory + branch  |  rate limits ───────────────────
